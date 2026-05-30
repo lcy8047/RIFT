@@ -137,6 +137,35 @@ class RiftMeta:
         else:
             raise TypeError(f"extract_meta expects a list of strings or a file path, got {type(source)}")
         
+    def get_custom_meta(self, commithash: str, arch: str, filetype: str, crates: list[str], compiler):
+        """Build custom RiftMeta based on Ida mask input."""
+        
+        rust_ver, ts, version_short = self.get_rust_version_for_hash(commithash)
+        if rust_ver is None:
+            self.logger.warning(f"Could not determine RustVersion for commit hash = {commithash}")
+        hash_short = commithash[0:9]
+        # Build target triple
+        metadata = RustMetadata(
+            commithash=commithash,
+            hash_short=hash_short,
+            crates=list(crates),
+            rust_version=rust_ver,
+            version_short=version_short,
+            compiler=compiler,
+            filetype=filetype,
+            arch=arch,
+            ts=ts
+        )
+
+        # Build and set target triple
+        try:
+            metadata.target_triple = metadata.get_target_triple()
+        except ValueError as e:
+            self.logger.warning(f"Could not build target triple: {e}")
+            metadata.target_triple = None
+
+        return metadata
+        
     def _extract_from_strings(self, strings: List[str], filetype=None, arch=None) -> RustMetadata:
         """
         Extract metadata from a list of strings.

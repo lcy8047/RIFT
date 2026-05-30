@@ -66,6 +66,7 @@ TARGET_MAP = {
 class RiftIdaForm(idaapi.PluginForm):
 
     def __init__(self, core, logger, rustmeta):
+        """Initialize form state and widget references."""
         super().__init__()
         self.core = core
         self.rustmeta = rustmeta
@@ -80,6 +81,8 @@ class RiftIdaForm(idaapi.PluginForm):
         self.compiler_flirt_box = None
         self.rust_compiler_field = None
         self.use_custom_fields = None
+        self.btn_add_dep = None
+        self.btn_remove_dep = None
         self.parent = None
         
         # Arch changed
@@ -88,6 +91,9 @@ class RiftIdaForm(idaapi.PluginForm):
         self._target_triple_changed = False
         # use custom set values
         self._use_custom_set_values = False
+        # track which custom fields the user has manually edited
+        self._commithash_edited = False
+        self._rustver_edited = False
 
         # RiftController, to kick off multithreading work
         self.rift_controller = RiftController(rift_core=self.core, logger=self.logger)
@@ -97,7 +103,27 @@ class RiftIdaForm(idaapi.PluginForm):
         self.PopulateForm()
         self.logger.info("Populating form done!")
 
+    def formToDefault(self):
+        """Updates the current form to default"""
+        self.commithash_edit.setText(self.rustmeta.commithash or "")
+
+        rust_version = self.rustmeta.get_channel()
+        self.rustver_edit.setText(rust_version if rust_version is not None else "NOT_IDENTIFIED")
+
+        self.arch_edit.setCurrentText(self.rustmeta.arch)
+
+        self.triple_suffix_combo.clear()
+        self.triple_suffix_combo.addItems(TARGET_MAP[self.rustmeta.arch])
+        triple_suffix = self.rustmeta.get_triple_suffix()
+        self.triple_suffix_combo.setCurrentText(triple_suffix if triple_suffix is not None else "NOT_IDENTIFIED")
+
+        self.rust_compiler_field.setText(self.rustmeta.get_target_compiler())
+        self._commithash_edited = False
+        self._rustver_edited = False
+
+
     def PopulateForm(self):
+        """Build and arrange all widgets in the form layout."""
 
         # Initialize VBox
         layout = QtWidgets.QFormLayout()
@@ -107,10 +133,15 @@ class RiftIdaForm(idaapi.PluginForm):
         # Rust Git Commithash
         self.commithash_edit = QtWidgets.QLineEdit(self.rustmeta.commithash)
         self.commithash_edit.setMaxLength(0x28)
+        self.commithash_edit.setReadOnly(True)
+        self.commithash_edit.textEdited.connect(lambda _: setattr(self, '_commithash_edited', True))
         rust_version = self.rustmeta.get_channel()
         if rust_version is None:
             rust_version = "NOT_IDENTIFIED"
         self.rustver_edit = QtWidgets.QLineEdit(rust_version)
+        self.rustver_edit.setReadOnly(True)
+        self.rustver_edit.textEdited.connect(lambda _: setattr(self, '_rustver_edited', True))
+        self.rustver_edit.textChanged.connect(lambda _: self._update_compiler_field())
 
         # Rust Target triple
         self.triple_suffix_combo = QtWidgets.QComboBox()
@@ -120,19 +151,23 @@ class RiftIdaForm(idaapi.PluginForm):
             triple_suffix = "NOT_IDENTIFIED"
         self.triple_suffix_combo.setCurrentText(triple_suffix)
         self.triple_suffix_combo.currentTextChanged.connect(self.onTargetTripleSuffixChanged)
+        self.triple_suffix_combo.currentTextChanged.connect(lambda _: self._update_compiler_field())
+        self.triple_suffix_combo.setEnabled(False)
 
         # Architecture
         self.arch_edit = QtWidgets.QComboBox()
         self.arch_edit.addItems(list(TARGET_MAP.keys()))
         self.arch_edit.setCurrentText(self.rustmeta.arch)
         self.arch_edit.currentTextChanged.connect(self.onArchSelectionChanged)
+        self.arch_edit.currentTextChanged.connect(lambda _: self._update_compiler_field())
+        self.arch_edit.setEnabled(False)
 
         # Dependencies
         # --- Dependencies as a table instead of QTextEdit ---
         self.crates_table = QtWidgets.QTableWidget()
         self.crates_table.setColumnCount(3)
         self.crates_table.setHorizontalHeaderLabels(["Name", "Version", "Apply FLIRT"])
-        self.crates_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)  # prevent inline editing for text cells
+        self.crates_table.setEditTriggers(QtWidgets.QAbstractItemView.DoubleClicked)
         self.crates_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.crates_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
         self.crates_table.verticalHeader().setVisible(False)
@@ -158,8 +193,9 @@ class RiftIdaForm(idaapi.PluginForm):
             self.set_server_status_available()
         else:
             self.set_server_status_unavailable()
-        self.enable_cb = QtWidgets.QCheckBox("Enable Server") 
-        self.enable_cb.setChecked(False) 
+        self.enable_cb = QtWidgets.QCheckBox("Enable Server")
+        self.enable_cb.setChecked(False)
+        self.enable_cb.stateChanged.connect(self.onEnableServerChanged)
         self.silent_cb = QtWidgets.QCheckBox("Apply FLIRT silently (Not supported yet)") 
         self.silent_cb.setChecked(False) 
         servers_opts_layout.addWidget(self.status_server, 1) 
@@ -174,6 +210,7 @@ class RiftIdaForm(idaapi.PluginForm):
         self.compiler_flirt_box.setChecked(True)
         self.use_custom_fields = QtWidgets.QCheckBox("Use custom set values (Experimental)")
         self.use_custom_fields.setChecked(False)
+        self.use_custom_fields.stateChanged.connect(self.onUseCustomFieldsChanged)
         opts_layout.addWidget(self.relmode_box)
         opts_layout.addWidget(self.compiler_flirt_box)
         opts_layout.addWidget(self.use_custom_fields)
@@ -198,13 +235,25 @@ class RiftIdaForm(idaapi.PluginForm):
             flirt_item.setText("")  # keep cell clean; checkbox only
             self.crates_table.setItem(row, 2, flirt_item)           
 
+        # Add / Remove dependency buttons (active only in custom-values mode)
+        self.btn_add_dep = QtWidgets.QPushButton("Add Dependency")
+        self.btn_add_dep.clicked.connect(self.onAddDependency)
+        self.btn_add_dep.setEnabled(False)
+        self.btn_remove_dep = QtWidgets.QPushButton("Remove Selected")
+        self.btn_remove_dep.clicked.connect(self.onRemoveDependency)
+        self.btn_remove_dep.setEnabled(False)
+        dep_btn_layout = QtWidgets.QHBoxLayout()
+        dep_btn_layout.addStretch()
+        dep_btn_layout.addWidget(self.btn_add_dep)
+        dep_btn_layout.addWidget(self.btn_remove_dep)
+
         # Buttons
         btn_apply = QtWidgets.QPushButton("Apply FLIRT")
         btn_apply.clicked.connect(self.onApply)
         btn_export = QtWidgets.QPushButton("Export Metadata")
         btn_export.clicked.connect(self.onExport)
-        btn_configure = QtWidgets.QPushButton("Configure")
-        btn_configure.clicked.connect(self.onConfigure)
+        btn_configure = QtWidgets.QPushButton("Reset")
+        btn_configure.clicked.connect(self.onReset)
         btn_cancel = QtWidgets.QPushButton("Cancel")
         btn_cancel.clicked.connect(self.onCancel)
 
@@ -222,23 +271,46 @@ class RiftIdaForm(idaapi.PluginForm):
         layout.addRow("Architecture: ", self.arch_edit)
         layout.addRow("Compiler Options: ", opts_layout)
         layout.addRow("Server Options: ", servers_opts_layout)
-        layout.addRow("Identified Rust Compiler: ", self.rust_compiler_field)
+        layout.addRow("Configured Rust Compiler: ", self.rust_compiler_field)
         layout.addRow("Dependencies", self.crates_table)
+        layout.addRow(dep_btn_layout)
+
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        layout.addRow(separator)
+
         layout.addRow(button_layout)
 
         # make our created layout the dialogs layout
         self.parent.setLayout(layout)
 
+    def onEnableServerChanged(self, state):
+        """Verify server availability when Enable Server is checked; uncheck and log if unavailable."""
+        if not state:
+            return
+        if self.core.rift_server_available():
+            self.logger.info("RIFT Server is available — server mode enabled")
+            self.set_server_status_available()
+        else:
+            self.logger.error("RIFT Server is not available — server mode has been disabled")
+            self.enable_cb.blockSignals(True)
+            self.enable_cb.setChecked(False)
+            self.enable_cb.blockSignals(False)
+            self.set_server_status_unavailable()
+
     def set_server_status_unavailable(self):
+        """Set the server status label to unavailable (red)."""
         self.status_server.setText("Rift Server: Not available")
         self.status_server.setStyleSheet("color: red; font-weight: 600;")
 
     def set_server_status_available(self):
+        """Set the server status label to available (green)."""
         self.status_server.setText("Rift Server: Available")
         self.status_server.setStyleSheet("color: green; font-weight: 600;")
 
-    # If apply is clicked, RiftForm reaches out to Rift Server if available and applies the signatures silently or not
     def onApply(self):
+        """Request FLIRT signature generation from the server for the selected output folder."""
 
         if not self.enable_cb.isChecked():
             self.logger.error("Enable Server is not set. Enable to start generating FLIRT signatures")
@@ -268,32 +340,81 @@ class RiftIdaForm(idaapi.PluginForm):
         return 1
       
     def onCancel(self):
+        """Close the form without applying any changes."""
         self.logger.info("Cancel clicked, closing form")
         self.Close(0)
         return 1
 
-    # TODO: Needs to update RustMeta by self provided information
-    def onConfigure(self):
+    def onReset(self):
+        """Uncheck custom values and restore all fields to the originally extracted metadata."""
         if self.core.rift_server_available():
             self.set_server_status_available()
         else:
             self.set_server_status_unavailable()
+        # Uncheck custom values and restore all fields to their original extracted values
+        self.use_custom_fields.setChecked(False)
+        self.formToDefault()
         return 1
     
     
+    def onUseCustomFieldsChanged(self, _state):
+        """Enable or disable editable metadata fields based on the custom values checkbox."""
+        enabled = self.use_custom_fields.isChecked()
+        self._use_custom_set_values = enabled
+        self.commithash_edit.setReadOnly(not enabled)
+        self.rustver_edit.setReadOnly(not enabled)
+        self.arch_edit.setEnabled(enabled)
+        self.triple_suffix_combo.setEnabled(enabled)
+        self.btn_add_dep.setEnabled(enabled)
+        self.btn_remove_dep.setEnabled(enabled)
+        if not enabled:
+            self._commithash_edited = False
+            self._rustver_edited = False
+
+    def _update_compiler_field(self):
+        """Recompute and display the configured Rust compiler string from current form values."""
+        arch = self.arch_edit.currentText()
+        triple_suffix = self.triple_suffix_combo.currentText()
+        rust_ver = self.rustver_edit.text().strip()
+        self.rust_compiler_field.setText(f"{rust_ver}-{arch}-{triple_suffix}")
+
+    def onAddDependency(self):
+        """Append a blank editable dependency row to the crates table."""
+        row = self.crates_table.rowCount()
+        self.crates_table.insertRow(row)
+
+        name_item = QtWidgets.QTableWidgetItem("")
+        name_item.setFlags(name_item.flags() | QtCore.Qt.ItemIsEditable)
+        self.crates_table.setItem(row, 0, name_item)
+
+        ver_item = QtWidgets.QTableWidgetItem("")
+        ver_item.setFlags(ver_item.flags() | QtCore.Qt.ItemIsEditable)
+        self.crates_table.setItem(row, 1, ver_item)
+
+        flirt_item = QtWidgets.QTableWidgetItem()
+        flirt_item.setFlags(QtCore.Qt.ItemIsEnabled | QtCore.Qt.ItemIsUserCheckable | QtCore.Qt.ItemIsSelectable)
+        flirt_item.setCheckState(QtCore.Qt.Checked)
+        flirt_item.setText("")
+        self.crates_table.setItem(row, 2, flirt_item)
+
+        self.crates_table.setCurrentCell(row, 0)
+        self.crates_table.editItem(name_item)
+
+    def onRemoveDependency(self):
+        """Remove the currently selected row from the crates table."""
+        row = self.crates_table.currentRow()
+        if row >= 0:
+            self.crates_table.removeRow(row)
+
     def onArchSelectionChanged(self, text):
         """Changes the triple_suffix depending on the selected architecture."""
         self.triple_suffix_combo.clear()
         self.triple_suffix_combo.addItems(TARGET_MAP[text])
         self._arch_changed = True
-        self._use_custom_set_values = True
-        self.use_custom_fields.setChecked(True)
-    
-    def onTargetTripleSuffixChanged(self, text):
+
+    def onTargetTripleSuffixChanged(self, _text):
         """Changes the selected target triple"""
         self._target_triple_changed = True
-        self._use_custom_set_values = True
-        self.use_custom_fields.setChecked(True)
 
     def onExport(self):
         """Dump the RustMeta information as a JSON file"""
@@ -306,6 +427,7 @@ class RiftIdaForm(idaapi.PluginForm):
         return 1
     
     def __get_rustmeta(self):
+        """Return the active RustMetadata, building it from custom form values if custom mode is on."""
         if not self.use_custom_fields.isChecked():
             return self.rustmeta
 
