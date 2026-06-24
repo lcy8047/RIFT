@@ -218,8 +218,12 @@ class RiftMeta:
 
         # Validate that we extracted required metadata
         if compiler is None:
-            self.logger.warning(f"Could not determine compiler, setting default compiler to msvc")
-            compiler = "msvc"
+            if filetype == "ELF":
+                self.logger.warning("Could not determine compiler, defaulting to gnu for ELF binary")
+                compiler = "gnu"
+            else:
+                self.logger.warning("Could not determine compiler, defaulting to msvc")
+                compiler = "msvc"
         if rust_ver is None:
             self.logger.error("Could not determine rust version or compiler!")
             return None
