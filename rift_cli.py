@@ -107,7 +107,7 @@ def main(args):
         return 0
 
 
-RIFT_ASCII = """
+RIFT_ASCII = r"""
  ____  ___ _____ _____
 |  _ \|_ _|  ___|_   _|
 | |_) || || |_    | |
